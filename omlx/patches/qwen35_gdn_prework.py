@@ -474,14 +474,20 @@ def _qwen4_wide_projections_enabled() -> bool:
     allocation of the GDN projections instead of the shipped oQe recipe.
 
     The eligibility predicate below is evaluated around projections that are
-    ordinary ``QuantizedLinear`` calls shared with the stock route, and the
-    fused kernels consume the resulting bf16 activations -- never the packed
-    weight storage. A given allocation therefore cannot change what the fused
-    kernels compute: it changes only ``in_proj_*``/``out_proj`` themselves, and
-    those run identically on both routes. The ``(4|5|6, 64)``/``(5, 128)``
-    allow-list in :func:`_qwen4_decode_static_eligible` was a converter
-    allow-list, not a kernel requirement, and it left the fused decode
-    disengaged on checkpoints whose GDN projections are allocated elsewhere --
+    ordinary ``QuantizedLinear`` calls shared with the stock route, and the fused
+    kernels consume the resulting bf16 activations. The allocation therefore
+    cannot change what the kernels compute. It does change how those four
+    projections are executed: at B=1/T=1 the route calls
+    ``_target_verify_linears``, which for a homogeneous recipe concatenates the
+    packed weights into a single ``quantized_matmul`` and otherwise falls back to
+    four separate calls. Both were measured bit-identical to four independent
+    ``QuantizedLinear`` calls at every allocation the opt-in admits, so a recipe
+    change is a performance and memory effect, not a numerical one -- see
+    ``test_qwen4_decode_wide_projections_are_bit_exact_either_way``.
+    The ``(4|5|6, 64)``/``(5, 128)`` allow-list in
+    :func:`_qwen4_decode_static_eligible` was a converter allow-list, not a kernel
+    requirement, and it left the fused decode disengaged on checkpoints whose GDN
+    projections are allocated elsewhere --
     8-bit/group-64 for the community Qwen3.8-Flash-Next exports, and a
     5-bit/group-64 ``in_proj_*`` with a 4-bit/group-64 ``out_proj`` for the
     27B Qwen3.5-lineage exports.
@@ -506,9 +512,14 @@ def _qwen4_wide_projections_enabled() -> bool:
 _ALLOWED_BITS = frozenset({2, 3, 4, 5, 6, 8})
 _ALLOWED_GROUPS = frozenset({32, 64, 128})
 
-# Residual width of the shipped Qwen4 geometry. Kept as a literal for the same
-# reason the conv dimension is: the static gate must not depend on attributes
-# that a reclassified/loaded module does not necessarily expose.
+# Residual width of the shipped Qwen4 geometry, kept as a literal on purpose.
+# The base class does expose ``module.hidden_size``, so this could be derived --
+# but deriving it would let a wider checkpoint past *this* check while the other
+# two family pins still reject it (``canonical_projection``'s ``in_dim=2560``
+# default and the ``(1, 1, 2560)`` dynamic-gate shape), i.e. the same model would
+# fail for inconsistent-looking reasons. Pinning all three to the shipped width
+# keeps the rejection legible and keeps widening the family an explicit change;
+# ``test_qwen4_decode_wide_opt_in_stays_within_the_2560_family`` holds that line.
 _QWEN4_HIDDEN_SIZE = 2560
 
 

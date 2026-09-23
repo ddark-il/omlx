@@ -531,6 +531,68 @@ def test_qwen4_decode_static_gate_fails_closed_on_opt_in(monkeypatch, attribute,
     assert not prework_mod._qwen4_decode_static_eligible(module)
 
 
+def test_qwen4_decode_wide_projections_are_bit_exact_either_way():
+    """The opt-in changes how the four in-projections execute, not what they give.
+
+    At B=1/T=1 the fused decode route obtains ``mixed_qkv, z, b, a`` from
+    ``_target_verify_linears``. For a homogeneous recipe that helper concatenates
+    the packed ``uint32`` weights and issues one ``quantized_matmul``; for a mixed
+    allocation it returns ``None`` and the route falls back to four separate
+    ``QuantizedLinear`` calls. Both outcomes are asserted here against four
+    independent calls, at every allocation the opt-in can admit, because the
+    concat path is the one place this route does read packed weight storage.
+
+    Scope note: this asserts the helper as imported from
+    ``mlx_vlm.speculative.ops.linear``. The MTP runtime
+    (``mlx_vlm_mtp/qwen35_verify_linear``) replaces the module attribute with a
+    wrapper, but its predicate only diverts ``shape[0] > 1`` or an armed
+    ``shape[1] > 1``, so a ``(1, 1, hidden)`` decode call falls through to
+    ``original_linears`` -- which is the helper asserted here. Checked directly
+    with the wrapper applied: max|delta| 0.0 against the original at
+    ``(1, 1, 2560)``.
+    """
+    from mlx_vlm.speculative.ops.linear import (
+        _decode_quantized_linears_fused,
+        _target_verify_linears,
+    )
+
+    hidden = 2560
+    rows = (C, HV * DV, HV, HV)
+    recipes = [
+        ((8, 64), (8, 64), (8, 64), (8, 64)),   # community opt8
+        ((5, 64), (5, 64), (5, 64), (5, 64)),   # 27B Qwen3.5-lineage
+        ((6, 128), (6, 128), (6, 128), (6, 128)),
+        ((2, 32), (2, 32), (2, 32), (2, 32)),   # smallest admitted affine pair
+        ((4, 64), (6, 64), (3, 64), (2, 128)),  # mixed: no concat, must fall back
+    ]
+    mx.random.seed(7)
+    inputs = (mx.random.normal((1, 1, hidden)) * 0.1).astype(mx.bfloat16)
+    for signatures in recipes:
+        linears = []
+        for output, (bits, group_size) in zip(rows, signatures):
+            weight = (mx.random.normal((output, hidden)) * 0.05).astype(mx.bfloat16)
+            packed, scales, biases = mx.quantize(
+                weight, group_size=group_size, bits=bits, mode="affine"
+            )
+            linear = nn.QuantizedLinear(
+                hidden, output, bias=False, group_size=group_size, bits=bits
+            )
+            linear.weight, linear.scales, linear.biases = packed, scales, biases
+            linears.append(linear)
+        separate = tuple(linear(inputs) for linear in linears)
+        fused = _target_verify_linears(tuple(linears), inputs)
+        mx.eval(*separate, *fused)
+        for expected, observed in zip(separate, fused):
+            assert mx.array_equal(expected, observed).item(), signatures
+        # the mixed allocation must genuinely take the fallback, so a future
+        # helper that silently stops concatenating cannot pass this vacuously
+        concat_applies = (
+            _decode_quantized_linears_fused(tuple(linears), inputs) is not None
+        )
+        homogeneous = len({(b, g) for b, g in signatures}) == 1
+        assert concat_applies == homogeneous, signatures
+
+
 def test_qwen4_decode_wide_allow_list_matches_the_quantizer():
     """The opt-in set must not drift past what the affine quantizer emits.
 
