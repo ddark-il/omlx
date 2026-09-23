@@ -515,7 +515,9 @@ def test_qwen4_decode_static_gate_community_allocations_are_opt_in(
     "attribute,value",
     [
         ("mode", "mxfp4"),
-        ("group_size", 96),          # not a group size the loader emits
+        ("group_size", 96),          # not a group size the quantizer implements
+        ("group_size", 16),          # nvfp4-only: mx.quantize rejects it
+        ("group_size", 256),         # ditto: affine tops out at 128
         ("bits", 7),                 # not an affine width we have been shown
     ],
 )
@@ -527,6 +529,23 @@ def test_qwen4_decode_static_gate_fails_closed_on_opt_in(monkeypatch, attribute,
 
     setattr(module.in_proj_a, attribute, value)
     assert not prework_mod._qwen4_decode_static_eligible(module)
+
+
+def test_qwen4_decode_wide_allow_list_matches_the_quantizer():
+    """The opt-in set must not drift past what the affine quantizer emits.
+
+    A recipe outside these sets cannot be produced by ``mx.quantize``, so
+    admitting it would only widen the surface the fused kernel has never been
+    shown against. Pinned to ``oq._AFFINE_GROUP_SIZES`` so a loader change that
+    adds a group size fails this test rather than silently narrowing coverage.
+    """
+    from omlx import oq
+
+    assert prework_mod._ALLOWED_GROUPS == frozenset(oq._AFFINE_GROUP_SIZES)
+    for bits in sorted(prework_mod._ALLOWED_BITS):
+        mx.quantize(mx.zeros((64, 2560)), group_size=64, bits=bits, mode="affine")
+    for group in sorted(prework_mod._ALLOWED_GROUPS):
+        mx.quantize(mx.zeros((64, 2560)), group_size=group, bits=8, mode="affine")
 
 
 def test_qwen4_decode_static_gate_fails_closed_on_noncanonical_bias(monkeypatch):

@@ -500,10 +500,11 @@ def _qwen4_wide_projections_enabled() -> bool:
     }
 
 
-# Only affine recipes the loader emits for these widths; anything else means the
-# projection came from something this patch has not been shown against.
+# Affine group sizes the quantizer implements (omlx/oq.py::_AFFINE_GROUP_SIZES)
+# and the affine widths it accepts. A projection outside these sets cannot have
+# come from the loader, so it fails closed rather than reaching the kernel.
 _ALLOWED_BITS = frozenset({2, 3, 4, 5, 6, 8})
-_ALLOWED_GROUPS = frozenset({16, 32, 48, 64, 128, 256})
+_ALLOWED_GROUPS = frozenset({32, 64, 128})
 
 # Residual width of the shipped Qwen4 geometry. Kept as a literal for the same
 # reason the conv dimension is: the static gate must not depend on attributes
