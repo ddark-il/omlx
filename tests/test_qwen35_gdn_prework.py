@@ -474,6 +474,71 @@ def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
     assert not prework_mod._qwen4_decode_static_eligible(module)
 
 
+@pytest.mark.parametrize(
+    "signatures,out_proj",
+    [
+        # Community Qwen3.8-Flash-Next opt8: every GDN projection is 8-bit/g64.
+        (((8, 64), (8, 64), (8, 64), (8, 64)), (8, 64)),
+        # 27B Qwen3.5-lineage exports: 5-bit/g64 projections, 4-bit/g64 out_proj.
+        (((5, 64), (5, 64), (5, 64), (5, 64)), (4, 64)),
+        # Mixed per-tensor allocations from a sensitivity search.
+        (((4, 64), (6, 64), (3, 64), (2, 128)), (4, 128)),
+    ],
+)
+def test_qwen4_decode_static_gate_community_allocations_are_opt_in(
+    monkeypatch, signatures, out_proj
+):
+    """The fused decode kernels never read the projections' packed storage.
+
+    They run after the four ``in_proj_*`` calls and after ``out_proj`` is the
+    only thing left on the stock route, so a checkpoint's bit allocation cannot
+    change what the kernels compute. The oQe allow-list was a converter
+    allow-list; the opt-in keeps every canonical-layout check but stops
+    demanding a specific recipe, which is what left community exports on the
+    unfused route.
+    """
+    module = _canonical_qwen4_decode_module(signatures)
+    module.out_proj = _fake_quantized_linear(6144, 2560, *out_proj)
+
+    monkeypatch.delenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", raising=False)
+    assert not prework_mod._qwen4_decode_static_eligible(module)
+
+    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
+    assert prework_mod._qwen4_decode_static_eligible(module)
+
+    # still fail-closed on the canonical-layout checks, not just the recipe
+    module.in_proj_z.group_size = 64 if module.in_proj_z.group_size == 128 else 128
+    assert not prework_mod._qwen4_decode_static_eligible(module)
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("mode", "mxfp4"),
+        ("group_size", 96),          # not a group size the loader emits
+        ("bits", 7),                 # not an affine width we have been shown
+    ],
+)
+def test_qwen4_decode_static_gate_fails_closed_on_opt_in(monkeypatch, attribute, value):
+    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
+    module = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
+    module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    assert prework_mod._qwen4_decode_static_eligible(module)
+
+    setattr(module.in_proj_a, attribute, value)
+    assert not prework_mod._qwen4_decode_static_eligible(module)
+
+
+def test_qwen4_decode_static_gate_fails_closed_on_noncanonical_bias(monkeypatch):
+    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
+    module = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
+    module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    assert prework_mod._qwen4_decode_static_eligible(module)
+
+    module.out_proj.biases = mx.zeros_like(module.out_proj.biases).astype(mx.float32)
+    assert not prework_mod._qwen4_decode_static_eligible(module)
+
+
 def test_qwen4_decode_static_gate_survives_prefill_linear_reclass():
     """The VLM engine reclasses projections for q4 prefill routing (#3755)."""
     module = _canonical_qwen4_decode_module(((6, 64), (6, 64), (6, 64), (6, 64)))
