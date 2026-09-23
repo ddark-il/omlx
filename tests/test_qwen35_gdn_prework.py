@@ -548,6 +548,42 @@ def test_qwen4_decode_wide_allow_list_matches_the_quantizer():
         mx.quantize(mx.zeros((64, 2560)), group_size=group, bits=8, mode="affine")
 
 
+@pytest.mark.parametrize("hidden_size", [5120, 4096, 2048])
+def test_qwen4_decode_wide_opt_in_stays_within_the_2560_family(
+    monkeypatch, hidden_size
+):
+    """The opt-in widens the *recipe* list only; it does not widen model width.
+
+    Three literals keep this route tied to the hidden-2560 family, and all three
+    are upstream's, not this patch's: ``canonical_projection``'s ``in_dim=2560``
+    default for the four ``in_proj_*``, ``_QWEN4_HIDDEN_SIZE`` as ``out_proj``'
+    rows, and the ``(1, 1, 2560)`` input shape in
+    ``_qwen4_decode_dynamic_eligible``. A wider checkpoint (a 5120-hidden
+    Qwen3.5-lineage export, say) fails on geometry alone even with a recipe the
+    opt-in admits. Asserting that here keeps generalising the family an explicit,
+    separately-tested change instead of an accident of this flag.
+    """
+    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
+    module = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
+    module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    assert prework_mod._qwen4_decode_static_eligible(module)
+
+    def widen(linear):
+        rows = linear.weight.shape[0]
+        return _fake_quantized_linear(hidden_size, rows, linear.bits, linear.group_size)
+
+    for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"):
+        wider = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
+        wider.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+        setattr(wider, name, widen(getattr(wider, name)))
+        assert not prework_mod._qwen4_decode_static_eligible(wider), name
+
+    # ...and a wider out_proj row count (hidden_size instead of 2560) also fails.
+    wider = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
+    wider.out_proj = _fake_quantized_linear(6144, hidden_size, 8, 64)
+    assert not prework_mod._qwen4_decode_static_eligible(wider)
+
+
 def test_qwen4_decode_static_gate_fails_closed_on_noncanonical_bias(monkeypatch):
     monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
     module = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
