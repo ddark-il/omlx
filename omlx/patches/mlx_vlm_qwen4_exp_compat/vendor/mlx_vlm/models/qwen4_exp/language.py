@@ -4787,16 +4787,37 @@ class Qwen4ExpModel(nn.Module):
             ):
                 mx.async_eval(hidden_states, *(write or ()))
             if hidden_sink is not None and index in capture:
+                # DFlash2 was trained on completed, zero-based layer outputs
+                # averaged over the hyper-connection streams; Lightning MTP
+                # consumes the mixer's mixed representation instead.
+                mean_capture = bool(
+                    getattr(self, "_omlx_dflash_capture_mean", False)
+                )
                 if write is None:
-                    mixed = self.hyper_connection_mixer(
-                        hidden_states, target_verify=target_verify
-                    )
+                    if mean_capture:
+                        completed = hidden_states
+                    else:
+                        mixed = self.hyper_connection_mixer(
+                            hidden_states, target_verify=target_verify
+                        )
                 else:
-                    mixed, hidden_states = self.hyper_connection_mixer(
-                        hidden_states, target_verify=target_verify, write=write
-                    )
+                    if mean_capture:
+                        completed = _hc_write(hidden_states, *write)
+                    else:
+                        mixed, completed = self.hyper_connection_mixer(
+                            hidden_states, target_verify=target_verify, write=write
+                        )
+                    hidden_states = completed
                     write = None
-                hidden_sink.append(mixed)
+                if mean_capture:
+                    completed = completed.reshape(
+                        *completed.shape[:-1],
+                        self.args.hc_count,
+                        self.args.hidden_size,
+                    ).mean(axis=-2)
+                    hidden_sink.append(completed)
+                else:
+                    hidden_sink.append(mixed)
 
         mixed = None
         if write is not None:
