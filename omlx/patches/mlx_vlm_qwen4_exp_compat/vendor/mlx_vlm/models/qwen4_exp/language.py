@@ -4338,6 +4338,9 @@ class Qwen4ExpPLELayer(nn.Module):
         self.short_conv_state_len = (
             config.ple_conv_kernel_size - 1
         ) * self.conv_dilation
+        from omlx.patches import qwen4_hadamard as _qh
+
+        self._qh_rot = _qh.rotations_for(hc_hidden_size, period=self.hidden_size)
         self.conv1d = nn.Conv1d(
             hc_hidden_size,
             hc_hidden_size,
@@ -4371,6 +4374,13 @@ class Qwen4ExpPLELayer(nn.Module):
         capture_speculative_state = target_verify and input_ids.shape[1] > 1
         if cache is not None:
             cache._qwen4_exp_ple_speculative_state = None
+        if self._qh_rot is not None:
+            # The PLE path contains a depthwise conv and per-channel gamma norms that a
+            # channel rotation does not commute with, so it runs in the unrotated basis and
+            # only its contribution to the residual is rotated.
+            from omlx.patches import qwen4_hadamard as _qh
+
+            hidden_states = _qh.apply_rotation(hidden_states, self._qh_rot, inverse=True)
         history = None
         if capture_speculative_state and cache is not None:
             history = self.ple_embedding._previous_context(
@@ -4411,7 +4421,12 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state=conv_state,
                 conv_inputs=normed,
             )
-        return gated_values + conv_output
+        result = gated_values + conv_output
+        if self._qh_rot is not None:
+            from omlx.patches import qwen4_hadamard as _qh
+
+            result = _qh.apply_rotation(result, self._qh_rot)
+        return result
 
 
 def _hc_write(hyper_input, branch, weights):
