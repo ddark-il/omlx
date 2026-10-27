@@ -68,9 +68,7 @@ def _hadamard(n: int) -> np.ndarray:
     return h / np.sqrt(n)
 
 
-def build_rotations(
-    dim: int, spec: HadamardSpec, period: int | None = None
-) -> tuple[mx.array, ...]:
+def build_rotations(dim: int, spec: HadamardSpec, period: int | None = None) -> tuple[mx.array, ...]:
     """Per-block ``R`` matrices, in block order. Cached."""
     key = (dim, spec.block, spec.signs_seed, period)
     if key in _CACHE:
@@ -96,9 +94,25 @@ def build_rotations(
     return _CACHE[key]
 
 
-def apply_rotation(
-    x: mx.array, rots: tuple[mx.array, ...], inverse: bool = False
-) -> mx.array:
+_STACKS: dict[tuple, mx.array] = {}
+
+
+def _batched_stack(rots: tuple[mx.array, ...], inverse: bool, dim: int, block: int) -> mx.array:
+    """All block matrices stacked into one [n_blocks, B, B] tensor, rebuilt only when specs change.
+
+    The per-block loop it replaces formed twenty matmul nodes plus a stack for every 10240-wide
+    conversion (290 conversions per decode token), and the measured conversion cost is ~32 ms/token
+    against ~14 ms of actual matmul work - the rest was CPU graph construction.
+    """
+    key = (dim, block, inverse, id(rots))
+    cached = _STACKS.get(key)
+    if cached is None:
+        cached = mx.array(np.stack([np.array(r.T if inverse else r) for r in rots]).astype(np.float32))
+        _STACKS[key] = cached
+    return cached
+
+
+def apply_rotation(x: mx.array, rots: tuple[mx.array, ...], inverse: bool = False) -> mx.array:
     """Rotate the last axis blockwise. ``inverse=True`` applies ``R^T``.
 
     The rotations are fp32; the result is cast back to ``x.dtype`` so a bf16
@@ -108,16 +122,12 @@ def apply_rotation(
     lead = x.shape[:-1]
     dim = x.shape[-1]
     v = x.reshape(*lead, dim // block, block)
-    parts = []
-    for i, r in enumerate(rots):
-        parts.append(v[..., i, :] @ (r.T if inverse else r))
-    out = mx.stack(parts, axis=-2).reshape(*lead, dim)
+    out = mx.einsum("...nb,nbj->...nj", v, _batched_stack(rots, inverse, dim, block))
+    out = out.reshape(*lead, dim)
     return out.astype(x.dtype) if out.dtype != x.dtype else out
 
 
-def configure_qwen4_hadamard(
-    model_dir: str | os.PathLike | None,
-) -> "HadamardSpec | None":
+def configure_qwen4_hadamard(model_dir: str | os.PathLike | None) -> "HadamardSpec | None":
     """Read ``hadamard`` from a checkpoint's config.json and activate it."""
     global _ACTIVE
     _ACTIVE = None
@@ -142,9 +152,7 @@ def configure_qwen4_hadamard(
     if block <= 0 or block & (block - 1):
         raise ValueError(f"Hadamard block must be a positive power of two, got {block}")
     _ACTIVE = HadamardSpec(block=block, signs_seed=seed)
-    logger.info(
-        "Qwen4-Exp Hadamard rotation active: block=%d signs_seed=%d", block, seed
-    )
+    logger.info("Qwen4-Exp Hadamard rotation active: block=%d signs_seed=%d", block, seed)
     return _ACTIVE
 
 
@@ -229,9 +237,14 @@ def apply_qwen4_hadamard() -> int:
                 )
             return apply_rotation(out, rots_mixed)
 
-        converted._omlx_hadamard_wrapped = True
-        Qwen4ExpGatedResidual.__call__ = converted
-        wrapped += 1
+        if hasattr(Qwen4ExpGatedResidual, "_qh_impl"):
+            # the vendored class already converts inside its own __call__ (v4); installing a
+            # wrapper on top would convert twice and re-add the dispatch this inlining removed
+            pass
+        else:
+            converted._omlx_hadamard_wrapped = True
+            Qwen4ExpGatedResidual.__call__ = converted
+            wrapped += 1
 
     original_init = Qwen4ExpModel.__init__
     if not getattr(original_init, "_omlx_hadamard_model_wrapped", False):
@@ -246,26 +259,72 @@ def apply_qwen4_hadamard() -> int:
     return wrapped
 
 
+def _is_descendant_of_mtp(module, head, modules) -> bool:
+    """True when ``module`` is one of ``head``'s own submodules (identity walk)."""
+    stack = [head]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if node is module:
+            return True
+        for _name, child in getattr(node, "children", lambda: {})().items() if hasattr(node, "children") else ():
+            stack.append(child)
+        for attr in ("layers", "hyper_connection_mixer"):
+            value = getattr(node, attr, None)
+            if isinstance(value, (list, tuple)):
+                stack.extend(v for v in value if v is not None)
+            elif value is not None:
+                stack.append(value)
+    return False
+
+
 def tag_hadamard_modules(model) -> int:
     """Opt every PLE and hyper-connection module of one loaded model into the conversion."""
     spec = active_spec()
     if spec is None:
         return 0
     tagged = 0
-    for module in getattr(model, "modules", lambda: [])():
+    modules = list(getattr(model, "modules", lambda: [])())
+    # The MTP draft head runs in the plain basis: tag it once for the input conversion and leave
+    # its internal hyper-connections untagged so the stream is not converted twice.
+    mtp_ids = set()
+    mtp_heads = []
+    for module in modules:
+        if type(module).__name__.startswith("Qwen4ExpMTP"):
+            mtp_ids.add(id(module))
+            mtp_heads.append(module)
+    for module in modules:
         hc = getattr(module, "hc_count", None)
         hidden = getattr(module, "hidden_size", None)
         if hc is None or hidden is None:
+            continue
+        if id(module) in mtp_ids or type(module).__name__.startswith("Qwen4ExpMTP"):
+            continue
+        if any(_is_descendant_of_mtp(module, head, modules) for head in mtp_heads):
             continue
         module._qh_rot = build_rotations(hc * hidden, spec, hidden)
         # The mixed output is hidden-wide, so it uses the per-stream rotation.
         module._qh_rot_mixed = build_rotations(hidden, spec, hidden)
         tagged += 1
     args = getattr(model, "args", None)
+    if args is None or getattr(args, "hidden_size", None) is None:
+        # the VLM wrapper does not carry ``args``; the language model does
+        language = getattr(model, "language_model", None)
+        args = getattr(language, "args", None) or args
     hidden = getattr(args, "hidden_size", None)
     if isinstance(hidden, int) and hidden % spec.block == 0:
-        # DFlash2 captures the hc mean; undo the basis change before the drafter.
+        # DFlash2 captures the hc mean and the MTP head fuses the hc stream; both need the
+        # hc-wide inverse rotation.
+        hc_count = getattr(args, "hc_count", 1) or 1
+        rots_hc = build_rotations(hidden * hc_count, spec, hidden)
         model._omlx_hadamard_capture_rots = build_rotations(hidden, spec, hidden)
+        for head in mtp_heads:
+            head._omlx_hadamard_capture_rots = rots_hc          # trunk hc stream
+            head._omlx_hadamard_token_rots = model._omlx_hadamard_capture_rots  # embeddings
+            head._omlx_hadamard_out_rots = model._omlx_hadamard_capture_rots    # folded lm_head
     return tagged
 
 
@@ -282,14 +341,9 @@ def _self_check() -> None:
     for i, r in enumerate(rots):
         dense[i * b:(i + 1) * b, i * b:(i + 1) * b] = np.array(r)
     orth = float(np.abs(dense.T @ dense - np.eye(dims)).max())
-    matmul = float(
-        mx.max(mx.abs(mx.array(x) @ mx.array(dense) @ mx.array(dense.T) - xm))
-    )
+    matmul = float(mx.max(mx.abs(mx.array(x) @ mx.array(dense) @ mx.array(dense.T) - xm)))
     scale = float(np.abs(x).max())
-    print(
-        f"self-check: round-trip max|err| = {err:.2e} "
-        f"({err/scale:.1e} relative, fp32 on this GPU)"
-    )
+    print(f"self-check: round-trip max|err| = {err:.2e} ({err/scale:.1e} relative, fp32 on this GPU)")
     print(f"self-check: blockwise == dense matmul max|err| = {matmul:.2e}")
     print(f"self-check: orthogonality max|R^T R - I| = {orth:.2e}")
     # Metal fp32 matmul is not exact: ~1e-3 relative on a 512-wide butterfly is the
