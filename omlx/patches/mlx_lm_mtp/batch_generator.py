@@ -2240,6 +2240,10 @@ def _call_backbone_impl(
         kwargs["n_confirmed"] = n_confirmed
     if capture_layer_ids:
         kwargs["capture_layer_ids"] = list(capture_layer_ids)
+        # qwen4's language model only captures GDN rollback state when
+        # ``gdn_sink`` is present; the block drafter needs it to trim the
+        # verify window. Other language models ignore the extra kwarg.
+        kwargs["gdn_sink"] = []
     # Decode-exact verify: embedded DSpark hosts and Lightning heads on
     # deepseek_v4 (see _exact_verify_host) run every projection and attention
     # row with one-row decode arithmetic, so greedy MTP output equals MTP-off.

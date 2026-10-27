@@ -5022,13 +5022,22 @@ class LanguageModel(Qwen3_5LanguageModel):
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         return_hidden = bool(kwargs.get("return_hidden", False))
-        mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        mtp_capture = return_hidden and capture_layer_ids is None
+        # The block drafter asks for explicit layer captures and must also get a
+        # rollback transaction; the MTP head only needs the implicit all-layer
+        # capture. ``gdn_sink`` marks the block-drafter verify forward.
+        block_capture = (
+            return_hidden
+            and capture_layer_ids is not None
+            and kwargs.get("gdn_sink") is not None
+        )
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
         # One-row windows (the activation step, depth-0 cycles) have no draft to
         # reject, so they run the serial decode step rather than a verify forward.
         one_row_step = (
-            mtp_capture
+            (mtp_capture or block_capture)
             and inputs_embeds is None
             and tuple(inputs.shape) == (1, 1)
             and cache is not None
@@ -5036,7 +5045,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         )
         transaction = (
             start_speculative_cache(cache or [], inputs.shape[1])
-            if mtp_capture and not one_row_step
+            if (mtp_capture or block_capture) and not one_row_step
             else None
         )
         step = _MTP_ONE_ROW_STEP.set(True) if one_row_step else None
