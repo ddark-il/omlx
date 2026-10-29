@@ -1337,17 +1337,13 @@ def _replace_cache_rows(
 
 
 def _initial_batch_forward(gen_batch):
-    """Advance fresh Qwen rows together without extracting target caches."""
-    from mlx_lm.models.cache import ArraysCache, BatchKVCache
+    """Advance fresh Qwen rows together without extracting target caches.
 
-    cache_types = (ArraysCache, BatchKVCache)
-    try:
-        from mlx_vlm.models.cache import ArraysCache as VLMArray
-        from mlx_vlm.models.cache import BatchKVCache as VLMKV
-    except ImportError:
-        pass
-    else:
-        cache_types += (VLMArray, VLMKV)
+    The per-row fallback extracts every row and merges the batch again, which
+    copies the whole KV bank at each activation, join, finish and unpark.
+    Rows still sample in order from their own logits, as on that fallback.
+    """
+    from .fused_batch import _supports_batch_rollback
 
     host = getattr(gen_batch.model, "_language_model", None)
     chain, _, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
@@ -1357,12 +1353,9 @@ def _initial_batch_forward(gen_batch):
         and not head_clone
         and getattr(host, "_omlx_mtp_batch_rollback", False)
         and gen_batch._next_tokens is not None
-        and all(type(c) in cache_types for c in gen_batch.prompt_cache)
-        and all(
-            _is_greedy(
-                _make_row_batch(gen_batch, i, prompt_cache=gen_batch.prompt_cache)
-            )
-            and not _row_value(gen_batch.logits_processors, i)
+        and all(_supports_batch_rollback(c) for c in gen_batch.prompt_cache)
+        and not any(
+            _row_value(gen_batch.logits_processors, i)
             for i in range(len(gen_batch.uids))
         )
     ):
@@ -3620,6 +3613,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
                         else state.depth
                     ),
                 )
+    _clip_to_shared_window(states)
     depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
     started = time.perf_counter()
     try:
@@ -4115,6 +4109,26 @@ def _clip_block_drafts(state: _MtpState, limit: int) -> None:
         state.draft_accept_lps = list(q)[:limit]
 
 
+def _clip_to_shared_window(states: List[_MtpState]) -> None:
+    """Clip the rows verifying this cycle to their shortest proposal.
+
+    A copied window can be longer than the head's drafts. Rows of different
+    lengths verify per row from extracted caches, and merging those back copies
+    the whole batch KV. A chain or copy prefix is still a complete proposal.
+    """
+    lengths = [
+        int(state.drafts.shape[0])
+        for state in states
+        if state.chain and not state.queue and state.drafts is not None
+    ]
+    if len(set(lengths)) < 2 or min(lengths) < 1:
+        return
+    limit = min(lengths)
+    for state in states:
+        if state.chain and not state.queue and state.drafts is not None:
+            _clip_block_drafts(state, limit)
+
+
 def _sparse_top_k(sampler) -> int:
     """Top-k of a sampler whose target filter is exactly top-p + top-k, else 0."""
     top_k = int(getattr(sampler, "top_k", 0) or 0)
@@ -4266,6 +4280,19 @@ def _predraft(gen_batch, state, drafter, captured, host_arr, m_arr, anchor) -> b
     return bool(predraft(gen_batch, state, captured, m_arr + 1, anchor))
 
 
+def _max_verify_rows(model: Any) -> Optional[int]:
+    """The target's ``_omlx_mtp_max_verify_rows`` cap, or None without one."""
+    for candidate in (
+        model,
+        getattr(model, "_language_model", None),
+        getattr(model, "language_model", None),
+    ):
+        rows = getattr(candidate, "_omlx_mtp_max_verify_rows", None)
+        if rows is not None:
+            return int(rows)
+    return None
+
+
 def _context_copy_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -4283,8 +4310,12 @@ def _context_copy_drafts(
     of exactly that many tokens replaces the drafter's block.
     """
     if state.context_copy is None:
+        # A wide copy verifies MAX_COPY + 1 rows, so it must fit the target's
+        # verify cap (GLM-5.3's indexer pool rolls back at most 8 rows).
+        cap = _max_verify_rows(gen_batch.model)
         state.context_copy = _context_copy.ContextCopy(
             wide_window=_row_exact_verify(gen_batch.model)
+            and (cap is None or cap > _context_copy.MAX_COPY)
         )
     copier = state.context_copy
     state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)

@@ -4108,6 +4108,57 @@ def test_clip_block_drafts_keeps_aligned_proposal_prefix():
     assert state.drafts.tolist() == [1]
 
 
+def test_clip_to_shared_window_aligns_rows_that_verify():
+    def row(length, *, copy=False, queued=False):
+        state = bg._MtpState(uid=length, chain=True)
+        state.drafts = mx.arange(length, dtype=mx.uint32)
+        if copy:
+            ids = mx.arange(length * 2, dtype=mx.int32).reshape(length, 2)
+            state.draft_accept_lps = bg.SparseDraftQ(ids, mx.zeros((length, 2)), 64)
+            state.copy_drafts = True
+        if queued:
+            state.queue.append((0, None, "draft"))
+        return state
+
+    head, copied, waiting = row(3), row(7, copy=True), row(5, queued=True)
+    bg._clip_to_shared_window([head, copied, waiting])
+    assert copied.drafts.tolist() == [0, 1, 2]
+    assert copied.draft_accept_lps.ids.shape[0] == 3
+    assert head.drafts.tolist() == [0, 1, 2]
+    assert waiting.drafts.shape[0] == 5
+
+
+def test_initial_batch_forward_keeps_model_owned_sampled_rows_in_place(monkeypatch):
+    class ModelOwnedCache:
+        _omlx_mtp_batch_rollback_cache = True
+        offset = mx.array([5, 7])
+
+    calls = []
+
+    def backbone(model, inputs, cache, **kwargs):
+        calls.append(tuple(inputs.shape))
+        return "logits", "hidden", None, None
+
+    monkeypatch.setattr(bg, "_resolve_mtp_chain_depth", lambda model: (True, 3, False))
+    monkeypatch.setattr(bg, "_set_batched_mrope_deltas", lambda *args: None)
+    monkeypatch.setattr(bg, "_call_backbone_captured", backbone)
+    batch = SimpleNamespace(
+        model=SimpleNamespace(
+            _language_model=SimpleNamespace(_omlx_mtp_batch_rollback=True)
+        ),
+        uids=[1, 2],
+        _next_tokens=mx.array([4, 9]),
+        prompt_cache=[ModelOwnedCache()],
+        samplers=[lambda lp: mx.random.categorical(lp)] * 2,
+        logits_processors=None,
+    )
+    assert bg._initial_batch_forward(batch) == ("logits", "hidden", [6, 8], None)
+    assert calls == [(2, 1)]
+
+    batch.logits_processors = [None, [lambda tokens, logits: logits]]
+    assert bg._initial_batch_forward(batch) is None
+
+
 @pytest.mark.parametrize("unequal_acceptance", [False, True])
 def test_active_batch_admits_new_row_without_rebuilding_old_rows(
     monkeypatch, unequal_acceptance
@@ -5311,22 +5362,22 @@ def test_batch_policy_skips_copied_windows(monkeypatch):
         mlx_lm_mtp.set_mtp_active(previous)
 
 
-@pytest.mark.parametrize("wide_window", [False, True])
-def test_context_copy_width_follows_the_targets_verify_window(wide_window):
+@pytest.mark.parametrize("family, width", [("qwen4", 15), ("glm5", 7)])
+def test_context_copy_width_follows_the_targets_verify_window(family, width):
     """A verbatim run after a whole accept copies 15 tokens only for a target
-    that verifies 16-row windows; other targets (GLM-5.3 rolls back at most
-    8 rows) keep 7-token copies."""
-    from omlx.patches.mlx_lm_mtp import context_copy
-
+    that verifies 16-row windows. GLM-5.3 is row-exact too, but its indexer
+    pool rolls back at most 8 rows, so it keeps 7-token copies."""
     source = list(range(1000, 1200))
     history = source + source[:100]  # the tail repeats the source verbatim
-    copier = context_copy.ContextCopy(wide_window=wide_window)
-    copier.extend(history, [])
-    assert copier.propose(64) == source[100:107]
-    copier.observe(7, 7)
-    copier.extend(history + source[100:107], [])
-    expected = 15 if wide_window else 7
-    assert copier.propose(64) == source[107 : 107 + expected]
+    gen_batch = SimpleNamespace(
+        model=_model(family), tokens=[history], max_tokens=[1000], _num_tokens=[0]
+    )
+    state = SimpleNamespace(context_copy=None)
+    assert bg._context_copy_drafts(gen_batch, state, []) == source[100:107]
+    state.context_copy.observe(7, 7)
+    gen_batch.tokens = [history + source[100:107]]
+    copied = bg._context_copy_drafts(gen_batch, state, [])
+    assert copied == source[107 : 107 + width]
 
 
 @pytest.mark.parametrize("size", [2, 4])
